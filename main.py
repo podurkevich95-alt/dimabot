@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -19,8 +20,13 @@ from openai import AsyncOpenAI, APIError, APIConnectionError, APITimeoutError
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
+# Твой личный Telegram Chat ID (число), куда бот будет присылать уведомления
+# о номерах телефонов клиентов, желающих обратный звонок.
+# Задаётся в Render как Environment Variable: ADMIN_CHAT_ID
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+
 # Модель, которую будем использовать через OpenRouter
-MODEL_NAME = "openai/gpt-3.5-turbo"
+MODEL_NAME = "openai/gpt-4o-mini"
 
 # Порт для Render (обязательно из переменной окружения, иначе Render не увидит открытый порт)
 PORT = int(os.environ.get("PORT", 10000))
@@ -74,7 +80,8 @@ Telegram живого менеджера (Дима): @Salyutuzmanagerpro
 НЕ используй давление или ложные ограничения: никогда не говори "осталось мало" или про несуществующие скидки/акции, если это не было явно указано тебе.
 НИКОГДА не советуй и не упоминай другие магазины или конкурентов — ты представляешь исключительно BENEFISUZ.
 Если клиент прямо спросит, бот ли ты — можешь честно сказать, что ты консультант BENEFISUZ (не обязательно уточнять технические детали), и что при необходимости подключится живой менеджер Дима.
-Отвечай кратко и по делу, избегай длинных нечитаемых простыней текста."""
+Отвечай кратко и по делу, избегай длинных нечитаемых простыней текста.
+ВАЖНО: если клиент переспрашивает, спорит или настаивает на другой версии фактов — НЕ меняй свой ответ и не путайся, если ты уже точно назвал характеристику или цену из каталога выше. Твёрдо повторяй правильные данные из каталога, а не соглашайся с клиентом просто чтобы не спорить. Если сам не уверен — честно скажи, что уточнишь у менеджера, вместо того чтобы противоречить себе."""
 
 # ==========================================================
 #                     ЛОГИРОВАНИЕ
@@ -104,6 +111,43 @@ ai_client = AsyncOpenAI(
 user_histories: dict[int, list[dict]] = {}
 MAX_HISTORY_MESSAGES = 10  # сколько последних сообщений храним на пользователя
 
+# Слова-триггеры, при которых клиента считаем "горячим" и шлём тебе уведомление
+LEAD_KEYWORDS = [
+    "хочу купить", "хочу заказать", "хочу сделать заказ", "оформить заказ",
+    "куплю", "закажу", "перезвоните", "перезвони", "свяжитесь", "готов купить",
+    "готова купить", "оплачу", "как оплатить", "хочу оформить",
+]
+PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{7,}\d)")
+
+
+def detect_lead(text: str) -> bool:
+    """Проверяет, похоже ли сообщение клиента на готовность к покупке или номер телефона."""
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in LEAD_KEYWORDS):
+        return True
+    if PHONE_REGEX.search(text):
+        return True
+    return False
+
+
+async def notify_admin_about_lead(message: Message) -> None:
+    """Присылает владельцу уведомление о 'горячем' клиенте."""
+    if not ADMIN_CHAT_ID:
+        return
+    client_name = message.from_user.full_name or "Клиент"
+    client_username = f"@{message.from_user.username}" if message.from_user.username else "без username"
+    notify_text = (
+        "🔥 <b>Горячий клиент!</b>\n\n"
+        f"Имя: {client_name}\n"
+        f"Username: {client_username}\n"
+        f"Сообщение: {message.text}\n\n"
+        f"Написать клиенту: tg://user?id={message.from_user.id}"
+    )
+    try:
+        await bot.send_message(int(ADMIN_CHAT_ID), notify_text)
+    except Exception as e:
+        logger.warning("Не удалось отправить уведомление админу: %s", e)
+
 
 # ==========================================================
 #                     ОБРАБОТЧИКИ TELEGRAM
@@ -131,6 +175,11 @@ async def handle_text(message: Message) -> None:
     history = history[-MAX_HISTORY_MESSAGES:]
     user_histories[chat_id] = history
 
+    # Если сообщение похоже на готовность к покупке или содержит номер телефона —
+    # сразу шлём уведомление владельцу магазина
+    if detect_lead(user_text):
+        asyncio.create_task(notify_admin_about_lead(message))
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
     await bot.send_chat_action(chat_id, action="typing")
@@ -139,7 +188,7 @@ async def handle_text(message: Message) -> None:
         response = await ai_client.chat.completions.create(
             model=MODEL_NAME,
             messages=messages,
-            temperature=0.7,
+            temperature=0.3,
             max_tokens=800,
         )
         answer = response.choices[0].message.content.strip()
