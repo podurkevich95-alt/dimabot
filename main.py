@@ -1,8 +1,12 @@
 import asyncio
+import csv
+import io
 import logging
 import os
 import re
+import time
 
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -35,21 +39,10 @@ SYSTEM_PROMPT = """Ты — Дима, живой онлайн-консульта
 Ты дружелюбный, живой, настоящий, с ноткой юмора и профессионализма — уверенный продавец. Используй 1-3 уместных эмодзи в каждом сообщении, в соответствующей моменту тональности.
 
 === КАТАЛОГ ТОВАРОВ (используй ТОЛЬКО эти данные, ничего не придумывай сверху) ===
-1. Салют "Зимний лес" — 8 залпов, фирма Новый век, эффект: 5, цена 580 000 сум. Фото: https://t.me/Salyutmagazin/493
-2. Салют "7 шот" — 7 залпов, фирма Новый век, эффект: 4, цена 550 000 сум. Фото: https://t.me/Salyutmagazin/488
-3. Салют "Волк" — 16 залпов, фирма Новый век, эффект: 8, цена 800 000 сум. Фото: https://t.me/Salyutmagazin/455
-4. Салют "Достлар / Друзья" — 48 залпов, фирма Новый век, 3 уникальных эффекта, цена 180$. Фото: https://t.me/Salyutmagazin/577
-5. Салют "Новогодняя Ёлка" — 36 залпов, фирма Новый век, эффект: 12, цена 150$. Фото: https://t.me/Salyutmagazin/575
-6. Салют "Ледяной дракон" — 100 залпов, фирма Казак салют, эффект: 10, цена 950$. Фото: https://t.me/Salyutmagazin/574
-7. Салют "Карнавальная ночь" — 100 залпов, фирма Новый век, эффект: 18, цена 1100$. Фото: https://t.me/Salyutmagazin/509
-8. Салют "Королевский" — 100 залпов, фирма Новый век, свист/треск/сияние и другое: 18, цена 950$. Фото: https://t.me/Salyutmagazin/508
-9. Салют "Королевский" — 36 залпов, фирма Новый век, свист/треск и другое: 12, цена 280$. Фото: https://t.me/Salyutmagazin/328
-10. Салют "Королевский" — 64 залпа, фирма Новый век, свист/треск/сияние и другое: 18, цена 580$. Фото: https://t.me/Salyutmagazin/476
-11. Салют "Лев" — 48 залпов, фирма Новый век, эффект: 3, цена 250$. Фото: https://t.me/Salyutmagazin/603
-12. Салют "Tongi otashinlar" — 64 залпа, фирма Новый век, свист/треск/сияние и другое: 12, цена 280$. Фото: https://t.me/Salyutmagazin/540
-13. Салют "Снегурочка" — 49 залпов, фирма Новый век, эффект: 12, цена 200$. Фото: https://t.me/Salyutmagazin/537
+__CATALOG__
 
 Цены указаны в той валюте, в которой заданы (доллары или сум) — не пересчитывай и не путай валюты.
+Позиции с пометкой [НЕТ В НАЛИЧИИ] сейчас недоступны: не предлагай их как имеющиеся, честно скажи, что этой позиции пока нет, и предложи похожие варианты из каталога.
 Если клиент спрашивает про товар, которого нет в этом списке — честно скажи, что именно этой позиции сейчас нет, и предложи ближайшие варианты из каталога, либо предложи уточнить у менеджера.
 
 === КАК ПОКАЗЫВАТЬ ФОТО/ВИДЕО ===
@@ -66,7 +59,7 @@ SYSTEM_PROMPT = """Ты — Дима, живой онлайн-консульта
 https://t.me/otzivsalyutuz — присылай эту ссылку, если видишь, что клиент сомневается или боится обмана. Компания работает на рынке более 6 лет, просто недавно обновили соцсети (это можно упомянуть, если спросят про недоверие).
 
 === КОНТАКТ МЕНЕДЖЕРА ===
-Telegram: @Salyutuzmanagerpro, телефон: +998773151415
+Telegram: @SalyutUzofficial, телефон: +998773151415
 Всегда делись этим контактом, когда клиент хочет или готов заказать салют после консультации.
 
 === ИСТОРИЯ КОМПАНИИ ===
@@ -88,8 +81,132 @@ Telegram: @Salyutuzmanagerpro, телефон: +998773151415
 НЕ заканчивай каждое сообщение шаблонной фразой вроде "Если у вас есть ещё вопросы, не стесняйтесь спрашивать!" или "Дайте знать, если нужна дополнительная информация!" — это звучит навязчиво и по-роботски. Добавляй такую фразу изредка, только когда это естественно завершает мысль, а не в конце каждого ответа.
 
 === ПОБОЧНОЕ ПРЕДЛОЖЕНИЕ (ТОЛЬКО КОГДА УМЕСТНО) ===
-Если клиент сам проявляет интерес к тому, КАК ты работаешь — например, спрашивает "ты бот?", "как вас сделали", "это ИИ?", "круто как вы это настроили", ИЛИ если клиент упоминает, что у него/неё есть свой бизнес, магазин, точка продаж — можешь ОДИН РАЗ за разговор, естественно и ненавязчиво, упомянуть: "Кстати, если вам интересно — для вашего бизнеса тоже можно сделать похожего бота-консультанта. Могу дать контакт, кто это настраивает, если хотите узнать подробнее 😊" и дать контакт @Salyutuzmanagerpro.
+Если клиент сам проявляет интерес к тому, КАК ты работаешь — например, спрашивает "ты бот?", "как вас сделали", "это ИИ?", "круто как вы это настроили", ИЛИ если клиент упоминает, что у него/неё есть свой бизнес, магазин, точка продаж — можешь ОДИН РАЗ за разговор, естественно и ненавязчиво, упомянуть: "Кстати, если вам интересно — для вашего бизнеса тоже можно сделать похожего бота-консультанта. Могу дать контакт, кто это настраивает, если хотите узнать подробнее 😊" и дать контакт @SalyutUzofficial.
 НЕ предлагай это первым в обычном разговоре о салютах — только если сам клиент дал повод. Не повторяй предложение дважды в одном диалоге."""
+
+# ==========================================================
+#          КАТАЛОГ ИЗ GOOGLE ТАБЛИЦЫ (с запасным вариантом)
+# ==========================================================
+# Таблицу можно менять в любой момент — бот подхватит изменения за пару минут.
+# Для другого магазина достаточно задать в Render переменные
+# CATALOG_SHEET_ID и CATALOG_SHEET_GID (код менять не нужно).
+CATALOG_SHEET_ID = os.environ.get("CATALOG_SHEET_ID", "1EMZKvVs1vDYreIBGGl7dopRuFGI1zRyYoGq2Pkb6pAQ")
+CATALOG_SHEET_GID = os.environ.get("CATALOG_SHEET_GID", "0")
+CATALOG_URLS = [
+    f"https://docs.google.com/spreadsheets/d/{CATALOG_SHEET_ID}/export?format=csv&gid={CATALOG_SHEET_GID}",
+    f"https://docs.google.com/spreadsheets/d/{CATALOG_SHEET_ID}/gviz/tq?tqx=out:csv&gid={CATALOG_SHEET_GID}",
+]
+CATALOG_TTL_SECONDS = 120    # как часто обновлять каталог из таблицы
+CATALOG_RETRY_SECONDS = 60   # пауза перед новой попыткой, если Google недоступен
+
+# Запасной каталог — используется, только если таблица недоступна и в памяти ничего нет.
+FALLBACK_CATALOG_ROWS = [
+    ["название", "залпов", "цена", "фирма", "ссылка на фото", "эффекты", "в наличии"],
+    ["Зимний лес", "8", "580 000 сум", "Новый век", "https://t.me/Salyutmagazin/493", "Треск, сияние, пионы, хризантема, комета, парча", "да"],
+    ["7 шот", "7", "550 000 сум", "Новый век", "https://t.me/Salyutmagazin/488", "Треск, сияние, пионы, хризантема, комета, парча", "да"],
+    ["Волк", "16", "800 000 сум", "Новый век", "https://t.me/Salyutmagazin/455", "Треск, сияние, пионы, хризантема, комета, парча, мерцание", "да"],
+    ["Достлар / Друзья", "48", "180$", "Новый век", "https://t.me/Salyutmagazin/577", "3 уникальных эффекта", "да"],
+    ["Новогодняя Ёлка", "36", "2 500 000 сум", "Новый век", "https://t.me/Salyutmagazin/575", "12", "да"],
+    ["Ледяной дракон", "100", "950$", "Казак салют", "https://t.me/Salyutmagazin/574", "10", "да"],
+    ["Карнавальная ночь", "100", "1600$", "Новый век", "https://t.me/Salyutmagazin/509", "18", "да"],
+    ["Королевский", "100", "950$", "Новый век", "https://t.me/Salyutmagazin/508", "18, свист, треск, сияние и другое", "да"],
+    ["Королевский", "36", "300$", "Новый век", "https://t.me/Salyutmagazin/328", "12, свист, треск и другое", "да"],
+    ["Королевский", "64", "580$", "Новый век", "https://t.me/Salyutmagazin/476", "18, свист, треск, сияние и другое", "да"],
+    ["Лев", "48", "250$", "Новый век", "https://t.me/Salyutmagazin/603", "3", "да"],
+    ["Tongi otashinlar", "64", "280$", "Новый век", "https://t.me/Salyutmagazin/540", "12, свист, треск, сияние и другое", "да"],
+    ["Снегурочка", "49", "220$", "Новый век", "https://t.me/Salyutmagazin/537", "12", "да"],
+]
+
+_catalog_cache = {"text": None, "ts": 0.0, "fail_ts": 0.0}
+_catalog_lock = asyncio.Lock()
+
+
+def format_catalog_rows(rows: list) -> str:
+    """Превращает строки таблицы в читаемый список для промпта.
+    Работает с любыми названиями колонок. Колонка с 'налич' в названии
+    управляет пометкой [НЕТ В НАЛИЧИИ]."""
+    if not rows:
+        return ""
+    headers = [h.strip() for h in rows[0]]
+    stock_idx = next((i for i, h in enumerate(headers) if "налич" in h.lower()), None)
+    lines = []
+    for row in rows[1:]:
+        cells = [c.strip() for c in row]
+        if not any(cells):
+            continue
+        parts = []
+        out_of_stock = False
+        for i, (header, value) in enumerate(zip(headers, cells)):
+            if not value:
+                continue
+            if i == stock_idx:
+                if value.lower().startswith("нет"):
+                    out_of_stock = True
+                continue
+            parts.append(f"{header}: {value}")
+        if not parts:
+            continue
+        line = f"{len(lines) + 1}. " + "; ".join(parts)
+        if out_of_stock:
+            line += " [НЕТ В НАЛИЧИИ]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+FALLBACK_CATALOG_TEXT = format_catalog_rows(FALLBACK_CATALOG_ROWS)
+
+
+async def fetch_catalog_rows():
+    """Скачивает таблицу как CSV. Возвращает список строк или None при неудаче."""
+    timeout = aiohttp.ClientTimeout(total=6)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for url in CATALOG_URLS:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning("Таблица: статус %s для %s", resp.status, url)
+                        continue
+                    text = (await resp.text(encoding="utf-8")).lstrip("\ufeff")
+                # Если вместо CSV пришла HTML-страница (например, запрос входа) — это не данные
+                if text.lstrip().startswith("<"):
+                    logger.warning("Таблица закрыта для чтения (пришла HTML-страница): %s", url)
+                    continue
+                rows = list(csv.reader(io.StringIO(text)))
+                if len(rows) >= 2:
+                    return rows
+            except Exception as e:
+                logger.warning("Не удалось загрузить таблицу (%s): %s", url, e)
+    return None
+
+
+async def get_catalog_text() -> str:
+    """Каталог для промпта: из таблицы -> из памяти (прошлая удачная версия) -> запасной."""
+    now = time.monotonic()
+    if _catalog_cache["text"] and now - _catalog_cache["ts"] < CATALOG_TTL_SECONDS:
+        return _catalog_cache["text"]
+    # Недавно была неудача — не тормозим ответы повторными попытками
+    if _catalog_cache["fail_ts"] and now - _catalog_cache["fail_ts"] < CATALOG_RETRY_SECONDS:
+        return _catalog_cache["text"] or FALLBACK_CATALOG_TEXT
+
+    async with _catalog_lock:
+        now = time.monotonic()
+        if _catalog_cache["text"] and now - _catalog_cache["ts"] < CATALOG_TTL_SECONDS:
+            return _catalog_cache["text"]
+        rows = await fetch_catalog_rows()
+        text = format_catalog_rows(rows) if rows else ""
+        if text:
+            _catalog_cache.update(text=text, ts=time.monotonic(), fail_ts=0.0)
+            logger.info("Каталог обновлён из таблицы")
+            return text
+        _catalog_cache["fail_ts"] = time.monotonic()
+        logger.warning("Каталог из таблицы недоступен — использую прошлую или запасную версию")
+        return _catalog_cache["text"] or FALLBACK_CATALOG_TEXT
+
+
+async def build_system_prompt() -> str:
+    catalog_text = await get_catalog_text()
+    return SYSTEM_PROMPT.replace("__CATALOG__", catalog_text)
+
 
 # ==========================================================
 #                     ЛОГИРОВАНИЕ
@@ -231,7 +348,7 @@ async def handle_text(message: Message) -> None:
     is_lead = detect_lead(user_text)
     is_bot_interest = detect_bot_interest(user_text)
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    messages = [{"role": "system", "content": await build_system_prompt()}] + history
 
     await bot.send_chat_action(chat_id, action="typing")
 
